@@ -1,22 +1,34 @@
 import threading
 import time
 import math
+import logging
 from dronekit import VehicleMode
+from config import (
+    RC_NEUTRAL, THROTTLE_TAKEOFF, PITCH_MAX_SPEED, PITCH_MEDIUM_SPEED, PITCH_SLOW_SPEED,
+    YAW_MAX_SPEED, YAW_MIN_SPEED, YAW_KP, YAW_TOLERANCE, YAW_TIMEOUT,
+    CONTROL_LOOP_DELAY, AUTOCORRECT_LOOP_DELAY, ALTITUDE_TOLERANCE,
+    DISTANCE_STOP_THRESHOLD, KP_DISTANCE, METERS_PER_DEGREE_LAT, EARTH_CIRCUMFERENCE
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
 class DroneController:
     def __init__(self, vehicle):
         self.vehicle = vehicle
-
         self.roll = 0
         self.pitch = 0
         self.throttle = 1000
         self.yaw = 0
-
         self.target_lat = None
         self.target_lon = None
         self.target_alt = None
-
         self._running_loops = True
         self._autocorrect_target = None
         self._autocorrect_active = False
@@ -28,7 +40,7 @@ class DroneController:
         threading.Thread(target=self._autocorrect_heading_loop, daemon=True).start()
 
     def _control_loop(self):
-        """Update RC channel overrides every 0.1 seconds."""
+        """Continuously update RC channel overrides."""
         while self._running_loops:
             try:
                 self.vehicle.channels.overrides = {
@@ -38,11 +50,11 @@ class DroneController:
                     "4": int(self.yaw)
                 }
             except Exception as e:
-                print(f"[ERROR] Failed to update channels: {e}")
-            time.sleep(0.1)
+                logger.error(f"Failed to update channels: {e}")
+            time.sleep(CONTROL_LOOP_DELAY)
 
     def _autocorrect_heading_loop(self):
-        """Adjust yaw to maintain heading towards the target coordinates every 0.1 seconds."""
+        """Adjust yaw to maintain heading towards the target coordinates."""
         while self._running_loops:
             if self._autocorrect_active and self._autocorrect_target:
                 current_yaw = self.get_current_yaw()
@@ -51,62 +63,62 @@ class DroneController:
                 yaw_diff = (raw_diff + 180) % 360 - 180
 
                 if abs(yaw_diff) < 0.5:
-                    self.yaw = 1500
+                    self.yaw = RC_NEUTRAL
                 else:
                     self.yaw = self._calculate_turn_speed(yaw_diff)
-            time.sleep(0.1)
+            time.sleep(AUTOCORRECT_LOOP_DELAY)
 
-    def _calculate_turn_speed(self, yaw_diff, max_speed=300, min_speed=25, k_p=0.7):
-        """Calculate the yaw rotation speed."""
-        if abs(yaw_diff) < 0.1:
-            return 1500
+    def _calculate_turn_speed(self, yaw_diff, max_speed=YAW_MAX_SPEED, min_speed=YAW_MIN_SPEED, k_p=YAW_KP):
+        """Calculate the yaw rotation speed based on the yaw difference."""
+        if abs(yaw_diff) < YAW_TOLERANCE:
+            return RC_NEUTRAL
         turn_speed = min(max(abs(yaw_diff) * k_p, min_speed), max_speed)
-        return 1500 + turn_speed if yaw_diff > 0 else 1500 - turn_speed
+        return RC_NEUTRAL + turn_speed if yaw_diff > 0 else RC_NEUTRAL - turn_speed
 
     def stop_control(self):
         """Stop all control loops and threads."""
         self._running_loops = False
-        print("[INFO] RC control threads stopped.")
+        logger.info("RC control threads stopped.")
 
     def arm_and_prepare(self):
-        """Arm the drone and set ALT_HOLD mode, ready to flight check."""
-        print("[INFO] Checking drone readiness for arming...")
+        """Arm the drone and set ALT_HOLD mode, ensuring readiness for flight."""
+        logger.info("Checking drone readiness for arming...")
         while not self.vehicle.is_armable:
-            print("[WARN] Drone not ready for arming. Waiting...", end="\r")
+            logger.warning("Drone not ready for arming. Waiting...")
             time.sleep(1)
 
-        print("[INFO] Setting ALT_HOLD mode...")
+        logger.info("Setting ALT_HOLD mode...")
         self.vehicle.mode = VehicleMode("ALT_HOLD")
         while self.vehicle.mode.name != "ALT_HOLD":
-            print("[INFO] Waiting for ALT_HOLD mode...")
+            logger.info("Waiting for ALT_HOLD mode...")
             time.sleep(1)
 
-        print("[INFO] Arming the drone...")
+        logger.info("Arming the drone...")
         self.vehicle.armed = True
         while not self.vehicle.armed:
-            print("[INFO] Waiting for arming completion...")
+            logger.info("Waiting for arming completion...")
             time.sleep(1)
 
-        print("[INFO] Drone armed and ready for flight!")
+        logger.info("Drone armed and ready for flight!")
 
     def takeoff_to_altitude(self, target_relative_alt: float):
         """Take off to the specified relative altitude."""
         if not isinstance(target_relative_alt, float):
-            print("[ERROR] Altitude must be a float!")
+            logger.error("Altitude must be a float!")
             return
         if target_relative_alt <= 0:
-            print("[ERROR] Target altitude must be greater than 0!")
+            logger.error("Target altitude must be greater than 0!")
             return
 
         while True:
             current_alt = self.vehicle.location.global_relative_frame.alt
-            print(f"[INFO] Current altitude: {current_alt:.2f} m", end="\r")
-            if current_alt >= target_relative_alt - 1:
-                self.throttle = 1500
-                print("[INFO] Target altitude reached.")
+            logger.info(f"Current altitude: {current_alt:.2f} m")
+            if current_alt >= target_relative_alt - ALTITUDE_TOLERANCE:
+                self.throttle = RC_NEUTRAL
+                logger.info("Target altitude reached.")
                 break
             else:
-                self.throttle = 1900
+                self.throttle = THROTTLE_TAKEOFF
             time.sleep(0.5)
 
     def get_current_yaw(self):
@@ -134,28 +146,28 @@ class DroneController:
         compass_bearing = (initial_bearing_deg + 360) % 360
         return compass_bearing
 
-    def rotate_to_target_yaw(self, target_yaw, tolerance=0.1, timeout=200):
+    def rotate_to_target_yaw(self, target_yaw, tolerance=YAW_TOLERANCE, timeout=YAW_TIMEOUT):
         """Rotate the drone to the specified yaw angle."""
         start_time = time.time()
-        print(f"[INFO] Current yaw: {self.get_current_yaw():.2f}")
-        print(f"[INFO] Target yaw: {target_yaw:.2f}")
+        logger.info(f"Current yaw: {self.get_current_yaw():.2f}")
+        logger.info(f"Target yaw: {target_yaw:.2f}")
 
         while time.time() - start_time < timeout:
             current_yaw = self.get_current_yaw()
             raw_diff = target_yaw - current_yaw
             yaw_diff = (raw_diff + 180) % 360 - 180
 
-            print(f"[INFO] Yaw difference: {yaw_diff:.2f}", end="\r")
+            logger.info(f"Yaw difference: {yaw_diff:.2f}")
             if abs(yaw_diff) <= tolerance:
-                self.yaw = 1500
-                print(f"[INFO] Drone aligned to target yaw. Difference: {yaw_diff:.2f}")
+                self.yaw = RC_NEUTRAL
+                logger.info(f"Drone aligned to target yaw. Difference: {yaw_diff:.2f}")
                 return True
 
             self.yaw = self._calculate_turn_speed(yaw_diff)
-            time.sleep(0.1)
+            time.sleep(CONTROL_LOOP_DELAY)
 
-        print(f"[ERROR] Timeout ({timeout}s) while rotating drone.")
-        self.yaw = 1500
+        logger.error(f"Timeout ({timeout}s) while rotating drone.")
+        self.yaw = RC_NEUTRAL
         return False
 
     def get_distance_to(self, target_lat: float, target_lon: float) -> float:
@@ -163,48 +175,50 @@ class DroneController:
         current_lat = self.vehicle.location.global_relative_frame.lat
         current_lon = self.vehicle.location.global_relative_frame.lon
 
-        delta_lat = (target_lat - current_lat) * 111320
-        delta_lon = (target_lon - current_lon) * 40075000 * math.cos(math.radians(current_lat)) / 360
+        delta_lat = (target_lat - current_lat) * METERS_PER_DEGREE_LAT
+        delta_lon = (target_lon - current_lon) * EARTH_CIRCUMFERENCE * math.cos(math.radians(current_lat)) / 360
         distance = math.sqrt(delta_lat**2 + delta_lon**2)
         return distance
 
-    def fly_forward_to(self, target_lat, target_lon, max_speed=1200, min_speed=1480, k_p=1, stop_threshold=0.1):
-        """Fly the drone to the target coordinates."""
-        print("[INFO] Flying to target coordinates...")
+    def fly_forward_to(self, target_lat: float, target_lon: float):
+        """Fly the drone to the target coordinates in ALT_HOLD mode."""
+        logger.info("Flying to target coordinates...")
         while self._running_loops:
             distance = self.get_distance_to(target_lat, target_lon)
-            print(f"[INFO] Distance to target: {distance:.2f} m", end="\r")
+            logger.info(f"Distance to target: {distance:.2f} m")
 
             if distance > 30:
-                self.pitch = max_speed
+                self.pitch = PITCH_MAX_SPEED
             elif distance > 5:
-                self.pitch = 1470
-            elif distance > 0.5:
-                self.pitch = 1477
+                self.pitch = PITCH_MEDIUM_SPEED
+            elif distance > DISTANCE_STOP_THRESHOLD:
+                self.pitch = PITCH_SLOW_SPEED
             else:
-                print(f"[INFO] Target reached. Position: {self.get_current_position()}")
+                logger.info(f"Target reached. Position: {self.get_current_position()}")
                 break
-            time.sleep(0.1)
-        self.pitch = 1500
+            time.sleep(CONTROL_LOOP_DELAY)
+        self.pitch = RC_NEUTRAL
 
     def enable_autocorrect_to_target(self, target_lat, target_lon):
-        """Enable yaw autocorrection."""
+        """Enable yaw autocorrection to face the target coordinates. """
         self._autocorrect_target = (target_lat, target_lon)
         self._autocorrect_active = True
+        logger.info("Yaw autocorrection enabled.")
 
     def disable_autocorrect_to_target(self):
         """Disable yaw autocorrection."""
         self._autocorrect_target = None
         self._autocorrect_active = False
+        logger.info("Yaw autocorrection disabled.")
 
     def land(self):
         """Land the drone by switching to LAND mode."""
-        print("[INFO] Initiating landing...")
+        logger.info("Initiating landing...")
         self.vehicle.mode = VehicleMode("LAND")
         while self.vehicle.armed:
-            print("[INFO] Waiting for landing completion...", end="\r")
+            logger.info("Waiting for landing completion...")
             time.sleep(1)
-        print("[INFO] Landing completed.")
+        logger.info("Landing completed.")
 
     def get_current_position(self):
         """Get the current position of the drone."""
